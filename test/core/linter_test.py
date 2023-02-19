@@ -2,6 +2,7 @@
 
 import os
 import logging
+from pathlib import Path
 from typing import List
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from sqlfluff.cli.outputstream import make_output_stream
 from sqlfluff.core.linter import LintingResult, NoQaDirective
 from sqlfluff.core.linter.runner import get_runner
 import sqlfluff.core.linter as linter
+from sqlfluff.core.linter import linted_file
 from sqlfluff.core.parser import GreedyUntil, Ref
 from sqlfluff.core.templaters import TemplatedFile
 
@@ -732,12 +734,12 @@ def test_parse_noqa_no_dups():
         "1_violations_comment_inline_glob_ignore",
     ],
 )
-def test_linted_file_ignore_masked_violations(
+def test_linted_variant_ignore_masked_violations(
     noqa: dict, violations: List[SQLBaseError], expected
 ):
     """Test that _ignore_masked_violations() correctly filters violations."""
     ignore_mask = [Linter.parse_noqa(rule_codes=dummy_rule_codes, **c) for c in noqa]
-    lf = linter.LintedFile(
+    lv = linted_file.LintedVariant(
         path="",
         violations=violations,
         time_dict={},
@@ -745,8 +747,9 @@ def test_linted_file_ignore_masked_violations(
         ignore_mask=ignore_mask,
         templated_file=TemplatedFile.from_string(""),
         encoding="utf8",
+        original_tree=None,  # type: ignore
     )
-    result = lf.ignore_masked_violations(violations, ignore_mask)
+    result = lv.ignore_masked_violations(violations, ignore_mask)
     expected_violations = [v for i, v in enumerate(violations) if i in expected]
     assert expected_violations == result
 
@@ -1054,3 +1057,16 @@ def test_require_match_parse_grammar():
     with pytest.raises(ValueError) as e:
         ansi_dialect.replace(StatementSegment=StatementSegment)
     assert "needs to define 'match_grammar'" in str(e.value)
+
+
+def test_fix_parse_error_lint_unreached_code():
+    """Test that parse error in unreached code does not affect fixing."""
+    base_dir = Path("test/fixtures/linter/parse_error_lint_unreached_code")
+    fixed_path = base_dir / "beforeFIXED.sql"
+    try:
+        lntr = Linter()
+        result = lntr.lint_path(str(base_dir / "before.sql"), fix=True)
+        result.persist_changes(fixed_file_suffix="FIXED")
+        assert fixed_path.read_text() == (base_dir / "after.sql").read_text()
+    finally:
+        fixed_path.unlink()

@@ -192,7 +192,7 @@ select * from a
 """,
             # The unwrapper should trim the ends.
             [
-                ("literal", slice(0, 15, None), slice(0, 15, None)),
+                ("literal", slice(0, 15, None), slice(0, 15, None), None),
             ],
         )
     ],

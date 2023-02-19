@@ -10,12 +10,16 @@ import logging
 import shutil
 import stat
 import tempfile
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import (
     Any,
+    Dict,
     Iterable,
     List,
     NamedTuple,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -27,7 +31,11 @@ from sqlfluff.core.errors import (
     SQLLintError,
     CheckTuple,
 )
-from sqlfluff.core.templaters import TemplatedFile, RawFileSlice
+from sqlfluff.core.templaters.base import (
+    TemplatedFile,
+    RawFileSlice,
+    TemplatedFileSlice,
+)
 
 # Classes needed only for type checking
 from sqlfluff.core.parser.segments import BaseSegment, FixPatch
@@ -38,32 +46,19 @@ from sqlfluff.core.linter.common import NoQaDirective
 linter_logger: logging.Logger = logging.getLogger("sqlfluff.linter")
 
 
-class LintedFile(NamedTuple):
-    """A class to store the idea of a linted file."""
+class LintedVariant(NamedTuple):
+    """A class to store the idea of a linted variant of a file."""
 
     path: str
     violations: List[SQLBaseError]
-    time_dict: dict
+    time_dict: Dict[str, float]
+    # Parse tree after any fixes have been applied
     tree: Optional[BaseSegment]
     ignore_mask: List[NoQaDirective]
     templated_file: TemplatedFile
     encoding: str
-
-    def check_tuples(self, raise_on_non_linting_violations=True) -> List[CheckTuple]:
-        """Make a list of check_tuples.
-
-        This assumes that all the violations found are
-        linting violations. If they don't then this function
-        raises that error.
-        """
-        vs: List[CheckTuple] = []
-        v: SQLLintError
-        for v in self.get_violations():
-            if isinstance(v, SQLLintError):
-                vs.append(v.check_tuple())
-            elif raise_on_non_linting_violations:
-                raise v
-        return vs
+    # Original parse tree (before fixes)
+    original_tree: Optional[BaseSegment]
 
     @staticmethod
     def deduplicate_in_source_space(
@@ -75,9 +70,8 @@ class LintedFile(NamedTuple):
         get a violation for each pass around the loop, but the user
         only cares about it once and we're only going to fix it once.
 
-        By filtering them early we get a more a more helpful CLI
-        output *and* and more efficient fixing routine (by handling
-        fewer fixes).
+        By filtering them early we get a more helpful CLI output *and* more
+        efficient fixing routine (by handling fewer fixes).
         """
         new_violations = []
         dedupe_buffer = set()
@@ -97,7 +91,7 @@ class LintedFile(NamedTuple):
         filter_ignore: bool = True,
         filter_warning: bool = True,
         fixable: Optional[bool] = None,
-    ) -> list:
+    ) -> List[SQLBaseError]:
         """Get a list of violations, respecting filters and ignore options.
 
         Optionally now with filters.
@@ -220,6 +214,267 @@ class LintedFile(NamedTuple):
         violations = cls._ignore_masked_violations_line_range(violations, ignore_range)
         return violations
 
+    @staticmethod
+    def _log_hints(patch: FixPatch, templated_file: TemplatedFile):
+        """Log hints for debugging during patch generation."""
+        # This next bit is ALL FOR LOGGING AND DEBUGGING
+        max_log_length = 10
+        if patch.templated_slice.start >= max_log_length:
+            pre_hint = templated_file.templated_str[
+                patch.templated_slice.start
+                - max_log_length : patch.templated_slice.start
+            ]
+        else:
+            pre_hint = templated_file.templated_str[: patch.templated_slice.start]
+        if patch.templated_slice.stop + max_log_length < len(
+            templated_file.templated_str
+        ):
+            post_hint = templated_file.templated_str[
+                patch.templated_slice.stop : patch.templated_slice.stop + max_log_length
+            ]
+        else:
+            post_hint = templated_file.templated_str[patch.templated_slice.stop :]
+        linter_logger.debug(
+            "        Templated Hint: ...%r <> %r...", pre_hint, post_hint
+        )
+
+    def generate_and_log_source_patches(self, tree) -> List[FixPatch]:
+        """Generate source patches and log them."""
+        linter_logger.debug("Original Tree: %r", self.templated_file.templated_str)
+        assert tree
+        linter_logger.debug("Fixed Tree: %r", tree.raw)
+
+        # The sliced file is contiguous in the TEMPLATED space.
+        # NB: It has gaps and repeats in the source space.
+        # It's also not the FIXED file either.
+        linter_logger.debug("### Templated File.")
+        for idx, file_slice in enumerate(self.templated_file.sliced_file):
+            t_str = self.templated_file.templated_str[file_slice.templated_slice]
+            s_str = self.templated_file.source_str[file_slice.source_slice]
+            if t_str == s_str:
+                linter_logger.debug(
+                    "    File slice: %s %r [invariant]", idx, file_slice
+                )
+            else:
+                linter_logger.debug("    File slice: %s %r", idx, file_slice)
+                linter_logger.debug("    \t\t\ttemplated: %r\tsource: %r", t_str, s_str)
+
+        # Generate patches from the fixed tree. In the process we sort
+        # and deduplicate them so that the resultant list is in the
+        # the right order for the source file without any duplicates.
+        filtered_source_patches = self._generate_source_patches(
+            tree, self.templated_file
+        )
+        linter_logger.debug("Filtered source patches:")
+        for idx, patch in enumerate(filtered_source_patches):
+            linter_logger.debug("    %s: %s", idx, patch)
+        return filtered_source_patches
+
+    @classmethod
+    def _generate_source_patches(
+        cls, tree: BaseSegment, templated_file: TemplatedFile
+    ) -> List[FixPatch]:
+        """Use the fixed tree to generate source patches.
+
+        Importantly here we deduplicate and sort the patches
+        from their position in the templated file into their
+        intended order in the source file.
+        """
+        # Iterate patches, filtering and translating as we go:
+        linter_logger.debug("### Beginning Patch Iteration.")
+        filtered_source_patches = []
+        dedupe_buffer = []
+        # We use enumerate so that we get an index for each patch. This is entirely
+        # so when debugging logs we can find a given patch again!
+        for idx, patch in enumerate(tree.iter_patches(templated_file=templated_file)):
+            linter_logger.debug("  %s Yielded patch: %s", idx, patch)
+            cls._log_hints(patch, templated_file)
+
+            # Check for duplicates
+            if patch.dedupe_tuple() in dedupe_buffer:
+                linter_logger.info(
+                    "      - Skipping. Source space Duplicate: %s",
+                    patch.dedupe_tuple(),
+                )
+                continue
+
+            # We now evaluate patches in the source-space for whether they overlap
+            # or disrupt any templated sections.
+            # The intent here is that unless explicitly stated, a fix should never
+            # disrupt a templated section.
+            # NOTE: We rely here on the patches being generated in order.
+            # TODO: Implement a mechanism for doing templated section fixes. Given
+            # these patches are currently generated from fixed segments, there will
+            # likely need to be an entirely different mechanism
+
+            # Get the affected raw slices.
+            local_raw_slices = templated_file.raw_slices_spanning_source_slice(
+                patch.source_slice
+            )
+            local_type_list = [slc.slice_type for slc in local_raw_slices]
+
+            # Deal with the easy cases of 1) New code at end 2) only literals
+            if not local_type_list or set(local_type_list) == {"literal"}:
+                linter_logger.info(
+                    "      * Keeping patch on new or literal-only section.",
+                )
+                filtered_source_patches.append(patch)
+                dedupe_buffer.append(patch.dedupe_tuple())
+            # Handle the easy case of an explicit source fix
+            elif patch.patch_category == "source":
+                linter_logger.info(
+                    "      * Keeping explicit source fix patch.",
+                )
+                filtered_source_patches.append(patch)
+                dedupe_buffer.append(patch.dedupe_tuple())
+            # Is it a zero length patch.
+            elif (
+                patch.source_slice.start == patch.source_slice.stop
+                and patch.source_slice.start == local_raw_slices[0].source_idx
+            ):
+                linter_logger.info(
+                    "      * Keeping insertion patch on slice boundary.",
+                )
+                filtered_source_patches.append(patch)
+                dedupe_buffer.append(patch.dedupe_tuple())
+            else:  # pragma: no cover
+                # We've got a situation where the ends of our patch need to be
+                # more carefully mapped. This used to happen with greedy template
+                # element matching, but should now never happen. In the event that
+                # it does, we'll warn but carry on.
+                linter_logger.warning(
+                    "Skipping edit patch on uncertain templated section [%s], "
+                    "Please report this warning on GitHub along with the query "
+                    "that produced it.",
+                    (patch.patch_category, patch.source_slice),
+                )
+                continue
+
+        # Sort the patches before building up the file.
+        return sorted(filtered_source_patches, key=lambda x: x.source_slice.start)
+
+
+@dataclass
+class LintedFile:
+    """Stores one or more linted variants of the same file."""
+
+    variants: List[LintedVariant] = field(default_factory=list)
+
+    def add_variant(self, variant: LintedVariant):
+        """Add a variant to the file."""
+        if self.variants:
+            if self.variants[0].path != variant.path:
+                raise ValueError(  # pragma: no cover
+                    "Cannot add variant to file with different path: "
+                    f"{self.variants[0].path} != {variant.path}"
+                )
+        self.variants.append(variant)
+
+    def get_violations(
+        self,
+        rules: Optional[Union[str, Tuple[str, ...]]] = None,
+        types: Optional[Union[Type[SQLBaseError], Iterable[Type[SQLBaseError]]]] = None,
+        filter_ignore: bool = True,
+        filter_warning: bool = True,
+        fixable: Optional[bool] = None,
+    ) -> List:
+        """Get a list of violations for this file.
+
+        The list of violations returned is suitable for lint output, but not
+        for fixing because the fixes are specific to the variant's tree. We'll
+        address this when generating and applying file patches.
+        """
+        # Trivial case: Just one variant
+        if len(self.variants) == 1:
+            return self.variants[0].get_violations(
+                rules=rules,
+                types=types,
+                filter_ignore=filter_ignore,
+                filter_warning=filter_warning,
+                fixable=fixable,
+            )
+
+        # In order to be included, a violation must meet one of the following
+        # criteria.
+        # - Case 1: It appears in _all_ variants
+        # - Case 2: It appears in one variant and is "source only" in the other
+        #   variant. (For now, we assume there are at most 2 variants.)
+
+        # Case 1 bookkeeping
+        violations_dict = defaultdict(set)
+        for idx, variant in enumerate(self.variants):
+            for violation in variant.get_violations(
+                rules=rules,
+                types=types,
+                filter_ignore=filter_ignore,
+                filter_warning=filter_warning,
+                fixable=fixable,
+            ):
+                violations_dict[violation].add(idx)
+        result = [
+            violation
+            for violation, idxs in violations_dict.items()
+            if len(idxs) == len(self.variants)
+        ]
+
+        # Case 2 bookkeeping
+        if len(self.variants) == 2:
+            for idx, variant in enumerate(self.variants):
+                violations = variant.get_violations(
+                    rules=rules,
+                    types=types,
+                    filter_ignore=filter_ignore,
+                    filter_warning=filter_warning,
+                    fixable=fixable,
+                )
+                for violation in violations:
+                    if violation in result or not isinstance(violation, SQLLintError):
+                        continue
+                    # Get the source slices touched by the violation.
+                    violation_source_slices: Set[Tuple[int, int]] = set()
+                    if violation.fixes:
+                        for fix in violation.fixes:
+                            temp_slice = fix.anchor.pos_marker.source_slice
+                            violation_source_slices.add(
+                                (temp_slice.start, temp_slice.stop)
+                            )
+                    else:
+                        temp_slice = violation.segment.pos_marker.source_slice
+                        violation_source_slices.add((temp_slice.start, temp_slice.stop))
+                    # Check if any of these slices appear in *templated* slices in the
+                    # other variant. If so, don't include the violation.
+                    other_variant_idx = 1 - idx
+                    if self._include_violation(
+                        violation_source_slices,
+                        self.variants[other_variant_idx].templated_file.sliced_file,
+                    ):
+                        result.append(violation)
+        return result
+
+    @staticmethod
+    def _include_violation(
+        raw_slices: Set[Tuple[int, int]],
+        templated_slices: List[TemplatedFileSlice],
+    ) -> bool:
+        """Return True if any raw_slices appear in templated_slices."""
+        for raw_slice in raw_slices:
+            for ts in templated_slices:
+                if (
+                    raw_slice[1] > ts.source_slice.start
+                    and ts.source_slice.stop > raw_slice[0]
+                ):
+                    return False
+        return True
+
+    @property
+    def violations(self) -> List:
+        """Return a list of all violations for this file."""
+        return self.get_violations()
+
+    def is_clean(self) -> bool:
+        """Return True if there are no ignorable violations."""
+        return not any(self.get_violations(filter_ignore=True))
+
     def num_violations(self, **kwargs) -> int:
         """Count the number of violations.
 
@@ -228,9 +483,53 @@ class LintedFile(NamedTuple):
         violations = self.get_violations(**kwargs)
         return len(violations)
 
-    def is_clean(self) -> bool:
-        """Return True if there are no ignorable violations."""
-        return not any(self.get_violations(filter_ignore=True))
+    @property
+    def path(self) -> str:
+        """Return the path of the file."""
+        if self.variants:
+            return self.variants[0].path
+        else:
+            raise ValueError(
+                "'path' is not defined for an empty LintedFile"
+            )  # pragma: no cover
+
+    @property
+    def templated_file(self) -> Optional[TemplatedFile]:
+        """Return the templated file."""
+        if self.variants:
+            return self.variants[0].templated_file
+        else:
+            return None  # pragma: no cover
+
+    @property
+    def tree(self) -> Optional[BaseSegment]:
+        """Return the tree for the first variant."""
+        return self.variants[0].tree
+
+    def check_tuples(self, raise_on_non_linting_violations=True) -> List[CheckTuple]:
+        """Make a list of check_tuples.
+
+        This assumes that all the violations found are
+        linting violations. If they don't then this function
+        raises that error.
+        """
+        vs: List[CheckTuple] = []
+        v: SQLLintError
+        for v in self.get_violations():
+            if isinstance(v, SQLLintError):
+                vs.append(v.check_tuple())
+            elif raise_on_non_linting_violations:
+                raise v
+        return vs
+
+    @property
+    def time_dict(self) -> Dict[str, float]:
+        """Return a dictionary of timings."""
+        timings: Dict[str, float] = {}
+        for variant in self.variants:
+            for k, v in variant.time_dict.items():
+                timings[k] = timings.get(k, 0) + v
+        return timings
 
     @staticmethod
     def _log_hints(patch: FixPatch, templated_file: TemplatedFile):
@@ -258,15 +557,12 @@ class LintedFile(NamedTuple):
 
     def fix_string(self) -> Tuple[Any, bool]:
         """Obtain the changes to a path as a string.
-
         We use the source mapping features of TemplatedFile
         to generate a list of "patches" which cover the non
         templated parts of the file and refer back to the locations
         in the original file.
-
         NB: This is MUCH FASTER than the original approach
         using difflib in pre 0.4.0.
-
         There is an important distinction here between Slices and
         Segments. A Slice is a portion of a file which is determined
         by the templater based on which portions of the source file
@@ -331,7 +627,6 @@ class LintedFile(NamedTuple):
         cls, tree: BaseSegment, templated_file: TemplatedFile
     ) -> List[FixPatch]:
         """Use the fixed tree to generate source patches.
-
         Importantly here we deduplicate and sort the patches
         from their position in the templated file into their
         intended order in the source file.
@@ -539,7 +834,9 @@ class LintedFile(NamedTuple):
             if suffix:
                 root, ext = os.path.splitext(fname)
                 fname = root + suffix + ext
-            self._safe_create_replace_file(self.path, fname, write_buff, self.encoding)
+            self._safe_create_replace_file(
+                self.path, fname, write_buff, self.variants[0].encoding
+            )
         return success
 
     @staticmethod

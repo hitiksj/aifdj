@@ -64,13 +64,14 @@ class RawFileSlice(NamedTuple):
     slice_subtype: Optional[str] = None
     # Block index, incremented on start or end block tags, e.g. "if", "for"
     block_idx: int = 0
+    tag: Optional[str] = None
 
     def end_source_idx(self):
         """Return the closing index of this slice."""
         return self.source_idx + len(self.raw)
 
     def source_slice(self):
-        """Return the a slice object for this slice."""
+        """Return a slice object for this slice."""
         return slice(self.source_idx, self.end_source_idx())
 
     def is_source_only_slice(self):
@@ -90,6 +91,7 @@ class TemplatedFileSlice(NamedTuple):
     slice_type: str
     source_slice: slice
     templated_slice: slice
+    slice_idx: Optional[int] = None
 
 
 class RawSliceBlockInfo(NamedTuple):
@@ -142,7 +144,7 @@ class TemplatedFile:
         # If we get here and we don't have sliced files, then it's raw, so create them.
         self.sliced_file: List[TemplatedFileSlice] = sliced_file or [
             TemplatedFileSlice(
-                "literal", slice(0, len(source_str)), slice(0, len(source_str))
+                "literal", slice(0, len(source_str)), slice(0, len(source_str)), 0
             )
         ]
         self.raw_sliced: List[RawFileSlice] = raw_sliced or [
@@ -489,7 +491,7 @@ class RawTemplater:
         fname: str,
         config: Optional[FluffConfig] = None,
         formatter=None,
-    ) -> Tuple[Optional[TemplatedFile], list]:
+    ) -> Tuple[Optional[TemplatedFile], List]:
         """Process a string and return a TemplatedFile.
 
         Note that the arguments are enforced as keywords
@@ -510,6 +512,13 @@ class RawTemplater:
 
         """
         return TemplatedFile(in_str, fname=fname), []
+
+    @large_file_check
+    def process_with_variants(
+        self, *, in_str: str, fname: str, config=None, formatter=None
+    ) -> Iterator[Tuple[Optional[TemplatedFile], List]]:
+        """Extended version of `process` which returns multiple variants."""
+        raise NotImplementedError  # pragma: no cover
 
     def __eq__(self, other):
         """Return true if `other` is of the same class as this one.

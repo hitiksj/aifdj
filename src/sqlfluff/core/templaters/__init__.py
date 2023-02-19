@@ -12,7 +12,12 @@ from sqlfluff.core.templaters.placeholder import PlaceholderTemplater
 
 def core_templaters():
     """Returns the templater tuples for the core templaters."""
-    yield from [RawTemplater, JinjaTemplater, PythonTemplater, PlaceholderTemplater]
+    yield from [
+        RawTemplater,
+        JinjaTemplater,
+        PythonTemplater,
+        PlaceholderTemplater,
+    ]
 
 
 __all__ = (

@@ -17,6 +17,7 @@ from typing_extensions import Literal
 
 from sqlfluff.core.errors import (
     CheckTuple,
+    SQLBaseError,
 )
 from sqlfluff.core.parser.segments.base import BaseSegment
 
@@ -109,7 +110,6 @@ class LintedDir:
         self, formatter: Any = None, fixed_file_suffix: str = "", **kwargs
     ) -> Dict[str, Union[bool, str]]:
         """Persist changes to files in the given path.
-
         This also logs the output as we go using the formatter if present.
         """
         # Run all the fixes for all the files and return a dict

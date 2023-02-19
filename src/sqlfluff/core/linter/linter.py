@@ -4,6 +4,7 @@ import fnmatch
 import os
 import time
 import logging
+from collections import defaultdict
 from typing import (
     Any,
     Iterable,
@@ -48,7 +49,7 @@ from sqlfluff.core.linter.common import (
     NoQaDirective,
     RenderedFile,
 )
-from sqlfluff.core.linter.linted_file import LintedFile
+from sqlfluff.core.linter.linted_file import LintedFile, LintedVariant
 from sqlfluff.core.linter.linted_dir import LintedDir
 from sqlfluff.core.linter.linting_result import LintingResult
 
@@ -372,45 +373,59 @@ class Linter:
         recurse: bool = True,
     ) -> ParsedString:
         """Parse a rendered file."""
+        for parsed in cls.parse_rendered_with_variants(
+            rendered=rendered, recurse=recurse
+        ):
+            return parsed
+        raise RuntimeError("RenderedFile is empty -- cannot parse.")  # pragma: no cover
+
+    @classmethod
+    def parse_rendered_with_variants(
+        cls,
+        rendered: RenderedFile,
+        recurse: bool = True,
+    ) -> Iterator[ParsedString]:
+        """Parse each TemplatedFile in the rendered file."""
         t0 = time.monotonic()
         violations = cast(List[SQLBaseError], rendered.templater_violations)
         tokens: Optional[Sequence[BaseSegment]]
-        if rendered.templated_file:
-            tokens, lvs, config = cls._lex_templated_file(
-                rendered.templated_file, rendered.config
-            )
-            violations += lvs
-        else:
-            tokens = None
+        for templated_file in rendered.templated_files:
+            if templated_file:
+                tokens, lvs, config = cls._lex_templated_file(
+                    templated_file, rendered.config
+                )
+                violations += lvs
+            else:
+                tokens = None
 
-        t1 = time.monotonic()
-        linter_logger.info("PARSING (%s)", rendered.fname)
+            t1 = time.monotonic()
+            linter_logger.info("PARSING (%s)", rendered.fname)
 
-        if tokens:
-            parsed, pvs = cls._parse_tokens(
-                tokens,
+            if tokens:
+                parsed, pvs = cls._parse_tokens(
+                    tokens,
+                    rendered.config,
+                    recurse=recurse,
+                    fname=rendered.fname,
+                )
+                violations += pvs
+            else:
+                parsed = None
+
+            time_dict = {
+                **rendered.time_dict,
+                "lexing": t1 - t0,
+                "parsing": time.monotonic() - t1,
+            }
+            yield ParsedString(
+                parsed,
+                violations,
+                time_dict,
+                templated_file,
                 rendered.config,
-                recurse=recurse,
-                fname=rendered.fname,
+                rendered.fname,
+                rendered.source_str,
             )
-            violations += pvs
-        else:
-            parsed = None
-
-        time_dict = {
-            **rendered.time_dict,
-            "lexing": t1 - t0,
-            "parsing": time.monotonic() - t1,
-        }
-        return ParsedString(
-            parsed,
-            violations,
-            time_dict,
-            rendered.templated_file,
-            rendered.config,
-            rendered.fname,
-            rendered.source_str,
-        )
 
     @classmethod
     def extract_ignore_from_comment(
@@ -479,6 +494,7 @@ class Linter:
     def lint_fix_parsed(
         cls,
         tree: BaseSegment,
+        parsed_variants: List[ParsedString],
         config: FluffConfig,
         rule_set: List[BaseRule],
         fix: bool = False,
@@ -615,6 +631,35 @@ class Linter:
                             # and/or fewer fixes next time.)
                             cls._warn_unfixable(crawler.code)
                         else:
+                            # If "lint_unreached_code" is set, lint the
+                            # secondary variants to see if they generate the
+                            # same violations. We only apply fixes that appear
+                            # in all the variants.
+                            # templater_name = config.get_section("core")["templater"]
+                            # if config.get_section(
+                            #     (
+                            #         "templater",
+                            #         templater_name,
+                            #         "lint_unreached_code",
+                            #     )
+                            # ):
+                            #     # TODO: Is it safe to use the same 'crawler'
+                            #     # instance across variants?
+                            #     filtered_fixes = cls._filter_fixes_across_variants(
+                            #         parsed_variants,
+                            #         fixes,
+                            #         fname,
+                            #         crawler,
+                            #         config,
+                            #         ignore_buff,
+                            #     )
+                            #     if len(filtered_fixes) < len(fixes):
+                            #         # Recompute anchor_info since some fixes were removed.
+                            #         fixes = filtered_fixes
+                            #         anchor_info = BaseSegment.compute_anchor_edit_info(
+                            #             fixes
+                            #         )
+
                             # This is the happy path. We have fixes, now we want to
                             # apply them.
                             last_fixes = fixes
@@ -690,13 +735,14 @@ class Linter:
     def lint_parsed(
         cls,
         parsed: ParsedString,
+        parsed_variants: List[ParsedString],
         rule_set: List[BaseRule],
         fix: bool = False,
         formatter: Any = None,
         encoding: str = "utf8",
-    ):
-        """Lint a ParsedString and return a LintedFile."""
-        violations = parsed.violations
+    ) -> LintedVariant:
+        """Lint a ParsedString and return a LintedVariant."""
+        violations = list(parsed.violations)
         time_dict = parsed.time_dict
         tree: Optional[BaseSegment]
         if parsed.tree:
@@ -704,6 +750,7 @@ class Linter:
             linter_logger.info("LINTING (%s)", parsed.fname)
             tree, initial_linting_errors, ignore_buff = cls.lint_fix_parsed(
                 parsed.tree,
+                parsed_variants=parsed_variants,
                 config=parsed.config,
                 rule_set=rule_set,
                 fix=fix,
@@ -742,31 +789,26 @@ class Linter:
             violation.ignore_if_in(parsed.config.get("ignore"))
             violation.warning_if_in(parsed.config.get("warnings"))
 
-        linted_file = LintedFile(
+        linted_variant = LintedVariant(
             parsed.fname,
             # Deduplicate violations
-            LintedFile.deduplicate_in_source_space(violations),
+            LintedVariant.deduplicate_in_source_space(violations),
             time_dict,
             tree,
             ignore_mask=ignore_buff,
             templated_file=parsed.templated_file,
             encoding=encoding,
+            original_tree=parsed.tree,
         )
 
-        # This is the main command line output from linting.
-        if formatter:
-            formatter.dispatch_file_violations(
-                parsed.fname, linted_file, only_fixable=fix
-            )
-
         # Safety flag for unset dialects
-        if linted_file.get_violations(
+        if linted_variant.get_violations(
             fixable=True if fix else None, types=SQLParseError
         ):
             if formatter:  # pragma: no cover TODO?
                 formatter.dispatch_dialect_warning(parsed.config.get("dialect"))
 
-        return linted_file
+        return linted_variant
 
     @classmethod
     def lint_rendered(
@@ -777,14 +819,43 @@ class Linter:
         formatter: Any = None,
     ) -> LintedFile:
         """Take a RenderedFile and return a LintedFile."""
-        parsed = cls.parse_rendered(rendered)
-        return cls.lint_parsed(
-            parsed,
+        parsed_variants = []
+        for idx, parsed in enumerate(cls.parse_rendered_with_variants(rendered)):
+            if not idx:
+                parsed_variants.append(parsed)
+            else:
+                # After the first (main) variant, ignore any variants that
+                # have parse errors. These may be caused by the tweaked
+                # templated so should be invisible to the user.
+                parse_errors = [
+                    v for v in parsed.violations if isinstance(v, SQLParseError)
+                ]
+                if not parse_errors:
+                    parsed_variants.append(parsed)
+                else:
+                    linter_logger.warning(
+                        "Skipping variant due to parse errors: %s", parse_errors
+                    )
+                    parsed_variants.append(None)
+                    continue
+        assert len(parsed_variants) == len(rendered.templated_files)
+        linted_variant = cls.lint_parsed(
+            parsed_variants[0],
             rule_set=rule_set,
+            parsed_variants=parsed_variants,
             fix=fix,
             formatter=formatter,
             encoding=rendered.encoding,
         )
+        linted_file = LintedFile()
+        linted_file.add_variant(linted_variant)
+
+        # This is the main command line output from linting.
+        if formatter:
+            formatter.dispatch_file_violations(
+                linted_file.path, linted_file, only_fixable=fix
+            )
+        return linted_file
 
     # ### Instance Methods
     # These are tied to a specific instance and so are not necessarily
@@ -820,24 +891,68 @@ class Linter:
                     "details."
                 )
             )
+        templated_files = []
+        all_templater_violations = []
         try:
-            templated_file, templater_violations = self.templater.process(
-                in_str=in_str, fname=fname, config=config, formatter=self.formatter
+            lint_unreached_code = (
+                config.get_section(
+                    (
+                        self.templater.templater_selector,
+                        self.templater.name,
+                        "lint_unreached_code",
+                    )
+                )
+                if config
+                else False
             )
+
+            process_iter = None
+            if lint_unreached_code:
+                try:
+                    # If configured to do so and the templater supports it, lint
+                    # unreached code.
+                    process_iter = self.templater.process_with_variants(
+                        in_str=in_str,
+                        fname=fname,
+                        config=config,
+                        formatter=self.formatter,
+                    )
+                except NotImplementedError:  # pragma: no cover
+                    linter_logger.warning(
+                        f"Templater {self.templater.name} does not support "
+                        f"linting unreached code."
+                    )
+            if not process_iter:
+                # Default/fallback behavior: Lint just the primary variant.
+                process_iter = iter(
+                    [
+                        self.templater.process(
+                            in_str=in_str,
+                            fname=fname,
+                            config=config,
+                            formatter=self.formatter,
+                        )
+                    ]
+                )
+            for templated_file, templater_violations in process_iter:
+                if not templated_file:
+                    linter_logger.info("TEMPLATING FAILED: %s", templater_violations)
+                templated_files.append(templated_file)
+                for templater_violation in templater_violations:
+                    if templater_violation not in all_templater_violations:
+                        all_templater_violations.append(templater_violation)
+
         except SQLFluffSkipFile as s:  # pragma: no cover
             linter_logger.warning(str(s))
-            templated_file = None
-            templater_violations = []
-
-        if not templated_file:
-            linter_logger.info("TEMPLATING FAILED: %s", templater_violations)
+            templated_files.append(None)
+            all_templater_violations = []
 
         # Record time
         time_dict = {"templating": time.monotonic() - t0}
 
         return RenderedFile(
-            templated_file,
-            templater_violations,
+            templated_files,
+            all_templater_violations,
             config,
             time_dict,
             fname,
@@ -861,6 +976,27 @@ class Linter:
         encoding: str = "utf-8",
     ) -> ParsedString:
         """Parse a string."""
+        for parsed in self.parse_string_with_variants(
+            in_str=in_str,
+            fname=fname,
+            recurse=recurse,
+            config=config,
+            encoding=encoding,
+        ):
+            return parsed
+        raise RuntimeError(
+            "Internal error: No variants returned by templater."
+        )  # pragma: no cover
+
+    def parse_string_with_variants(
+        self,
+        in_str: str,
+        fname: str = "<string>",
+        recurse: bool = True,
+        config: Optional[FluffConfig] = None,
+        encoding: str = "utf-8",
+    ) -> Iterator[ParsedString]:
+        """Parse variants of a string."""
         violations: List[SQLBaseError] = []
 
         # Dispatch the output for the template header (including the config diff)
@@ -879,7 +1015,7 @@ class Linter:
         if self.formatter:
             self.formatter.dispatch_parse_header(fname)
 
-        return self.parse_rendered(rendered, recurse=recurse)
+        yield from self.parse_rendered_with_variants(rendered, recurse=recurse)
 
     def fix(
         self,
@@ -939,22 +1075,28 @@ class Linter:
         """
         # Sort out config, defaulting to the built in config if no override
         config = config or self.config
+        linted_file = None
         # Parse the string.
-        parsed = self.parse_string(
+        for parsed in self.parse_string_with_variants(
             in_str=in_str,
             fname=fname,
             config=config,
-        )
-        # Get rules as appropriate
-        rule_set = self.get_ruleset(config=config)
-        # Lint the file and return the LintedFile
-        return self.lint_parsed(
-            parsed,
-            rule_set,
-            fix=fix,
-            formatter=self.formatter,
-            encoding=encoding,
-        )
+        ):
+            # Get rules as appropriate
+            rule_set = self.get_ruleset(config=config)
+            # Lint the file and return the LintedFile
+            linted_variant = self.lint_parsed(
+                parsed,
+                rule_set,
+                fix=fix,
+                formatter=self.formatter,
+                encoding=encoding,
+            )
+            if not linted_file:
+                linted_file = LintedFile()
+            linted_file.add_variant(linted_variant)
+        assert linted_file
+        return linted_file
 
     def paths_from_path(
         self,
@@ -1214,10 +1356,52 @@ class Linter:
             except SQLFluffSkipFile as s:
                 linter_logger.warning(str(s))
                 continue
-            yield self.parse_string(
+            yield from self.parse_string_with_variants(
                 raw_file,
                 fname=fname,
                 recurse=recurse,
                 config=config,
                 encoding=encoding,
             )
+
+    @classmethod
+    def _filter_fixes_across_variants(
+        cls, parsed_variants, fixes, fname, rule, config, ignore_buff
+    ):
+        """Filter fixes across variants.
+
+        Run the same rule sequentially against secondary variants. Keep a fix
+        only if every variant generates the same fix.
+
+        Parameters:
+        :param parse_variants: List of ParsedFile, one for each variant
+        :param fixes: List of fixes generated for the 0th variant
+        :param fname: Name of the file
+        :param rule: Rule object that generated 'fixes'
+        :param config: Config object
+        :param ignore_buff: List of ignored violations
+        """
+        # Count occurrences of each fix across the secondary variants.
+        fixes_count = defaultdict(int)
+        for variant_idx, parsed_variant in enumerate(parsed_variants):
+            if variant_idx:
+                _, _, variant_fixes, _ = rule.crawl(
+                    parsed_variant.tree,
+                    dialect=config.get("dialect_obj"),
+                    fix=True,
+                    templated_file=parsed_variant.templated_file,
+                    ignore_mask=ignore_buff,
+                    fname=fname,
+                    config=config,
+                )
+                for fix_idx, fix in enumerate(fixes):
+                    if any(
+                        fix.equivalent(variant_fix) for variant_fix in variant_fixes
+                    ):
+                        fixes_count[fix_idx] += 1
+        # Keep only fixes that were found in all secondary variants.
+        filtered_fixes = []
+        for fix_idx, fix_count in fixes_count.items():
+            if fix_count == len(parsed_variants) - 1:
+                filtered_fixes.append(fixes[fix_idx])
+        return filtered_fixes

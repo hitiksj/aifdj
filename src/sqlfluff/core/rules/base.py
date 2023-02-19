@@ -35,7 +35,8 @@ from collections import namedtuple
 
 from sqlfluff.core.config import FluffConfig
 
-from sqlfluff.core.linter import LintedFile, NoQaDirective
+from sqlfluff.core.linter import NoQaDirective
+from sqlfluff.core.linter.linted_file import LintedVariant
 from sqlfluff.core.parser import BaseSegment, PositionMarker, RawSegment
 from sqlfluff.core.dialects import Dialect
 from sqlfluff.core.errors import SQLLintError
@@ -267,8 +268,35 @@ class LintFix:
         # If types match, check uuids to see if they're the same original segment.
         if self.anchor.uuid != other.anchor.uuid:
             return False
-        # Then compare edits, here we only need to check the raw and source
-        # fixes (positions are meaningless).
+        return self._eq_helper(other)
+
+    def equivalent(self, other):
+        """Compare logical equivalence with another fix.
+
+        This is very similar to equality, it checks anchor position rather than
+        UUID. This is useful for comparing fixes which have been applied to
+        different variants of the same file.
+        """
+        if not self.edit_type == other.edit_type:
+            return False
+        # For checking anchor equality, first check types.
+        if not self.anchor.class_types == other.anchor.class_types:
+            return False
+        # If types match, check uuids to see if they're the same original segment.
+        if (
+            self.anchor.pos_marker.source_position()
+            != other.anchor.pos_marker.source_position()
+        ):
+            return False
+        return self._eq_helper(other)
+
+    def _eq_helper(self, other):
+        """Helper function for LintFix equality.
+
+        It's called once the basic checks have been done.
+        """
+        # Compare edits. Here we only need to check the raw and source fixes
+        # (positions are meaningless).
         # Only do this if we have edits.
         if self.edit:
             # 1. Check lengths
@@ -708,7 +736,7 @@ class BaseRule:
                     break
 
             if lerr and ignore_mask:
-                filtered = LintedFile.ignore_masked_violations([lerr], ignore_mask)
+                filtered = LintedVariant.ignore_masked_violations([lerr], ignore_mask)
                 if not filtered:
                     lerr = None
                     ignored = True
